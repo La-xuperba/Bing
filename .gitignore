@@ -1,7 +1,0 @@
-state/
-state_repo/
-square_drafts.txt
-pre_pump_ranking_*.csv
-__pycache__/
-.env
-.pytest_cache/

@@ -1,9 +1,6 @@
 import time
 import requests
 import pandas as pd
-import time
-import requests
-import pandas as pd
 import numpy as np
 from datetime import datetime
 import random
@@ -15,12 +12,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 BINANCE_SQUARE_API_KEY = os.getenv("BINANCE_SQUARE_API_KEY")
 
 MIN_SCORE = 50
-SCAN_INTERVAL = 90
-COOLDOWN_MINUTES = 45
-MIN_24H_VOLUME = 800000
-
-# ====================================================
-
+SCAN_INTERVAL = 90          # seconds
+COOLDOWN_MINUTES = 45       # same coin cooldown
+MIN_24H_VOLUME = 800000     # USDT
 # ====================================================
 
 BASE_URL = "https://api.binance.com"
@@ -143,7 +137,6 @@ def calculate_score(symbol):
         vol_ratio = current_vol / avg_vol if avg_vol > 0 else 0
 
         taker_ratio = taker_buy.iloc[-1] / vol.iloc[-1] if vol.iloc[-1] > 0 else 0
-        # Simple Volume Delta approximation
         delta = (taker_buy.iloc[-3:].sum() - (vol.iloc[-3:].sum() - taker_buy.iloc[-3:].sum()))
 
         s_vol = 0
@@ -167,13 +160,10 @@ def calculate_score(symbol):
 
         # ========== Extra Confluence (15 points) ==========
         s_extra = 0
-        # Simple higher high check
         if close15.iloc[-1] > close15.iloc[-4] and close1h.iloc[-1] > close1h.iloc[-3]:
             s_extra += 6
-        # RSI alignment bonus
         if rsi15 > 55 and rsi1h > 52:
             s_extra += 5
-        # Price above key MAs multi TF
         if close15.iloc[-1] > ema20_15.iloc[-1] and close1h.iloc[-1] > ma50_1h.iloc[-1]:
             s_extra += 4
 
@@ -232,12 +222,16 @@ def post_to_square(text):
 
 def main():
     print("Bot started...")
+    
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Error: Telegram credentials missing!")
+        return
+
     symbols = get_all_usdt_symbols()
     print(f"Total symbols: {len(symbols)}")
 
     while True:
         try:
-            # Get 24h volume filter
             tickers = requests.get(f"{BASE_URL}/api/v3/ticker/24hr").json()
             vol_map = {t["symbol"]: float(t["quoteVolume"]) for t in tickers}
 
@@ -252,10 +246,9 @@ def main():
                 if score >= MIN_SCORE:
                     candidates.append((sym, score, details, info))
 
-            # Sort by score
             candidates.sort(key=lambda x: x[1], reverse=True)
 
-            for sym, score, details, info in candidates[:4]:  # max 4 per cycle
+            for sym, score, details, info in candidates[:4]:
                 msg = f"""
 <b>Binance Spot Signal</b>
 
@@ -273,10 +266,9 @@ Time: {datetime.now().strftime('%H:%M:%S')}
                 send_telegram(msg)
                 print(f"Alert sent: {sym} | Score {score}")
 
-                # Square post
                 post_text = generate_square_post(sym, info['price'], score, info['change_15m'])
                 post_to_square(post_text)
-                time.sleep(random.randint(11, 16))  # 10-15s gap
+                time.sleep(random.randint(11, 16))
 
                 alerted[sym] = time.time()
 

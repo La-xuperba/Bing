@@ -1,19 +1,25 @@
 import time
 import requests
 import pandas as pd
+import time
+import requests
+import pandas as pd
 import numpy as np
 from datetime import datetime
 import random
+import os
 
 # ====================== CONFIG ======================
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
-BINANCE_SQUARE_API_KEY = "YOUR_BINANCE_SQUARE_OPENAPI_KEY"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+BINANCE_SQUARE_API_KEY = os.getenv("BINANCE_SQUARE_API_KEY")
 
 MIN_SCORE = 50
-SCAN_INTERVAL = 90          # seconds
-COOLDOWN_MINUTES = 45       # same coin cooldown
-MIN_24H_VOLUME = 800000     # USDT
+SCAN_INTERVAL = 90
+COOLDOWN_MINUTES = 45
+MIN_24H_VOLUME = 800000
+
+# ====================================================
 
 # ====================================================
 

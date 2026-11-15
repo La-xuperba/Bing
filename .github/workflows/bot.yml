@@ -1,0 +1,56 @@
+name: Coin Bot
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"      # restarts the bot every 6 hours
+  workflow_dispatch:            # manual start button
+
+# never run two copies at once
+concurrency:
+  group: coin-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # Binance's official Square posting scripts (used for image posts).
+      # If this step fails the bot still posts text-only.
+      - name: Get Binance Square scripts
+        continue-on-error: true
+        run: git clone --depth 1 https://github.com/binance/binance-skills-hub square-skill
+
+      # keeps cooldowns, open signals and win/loss stats between 6-hour runs
+      - uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: coinbot-state-${{ github.run_id }}
+          restore-keys: coinbot-state-
+
+      - name: Run bot
+        run: python bot.py
+        env:
+          BINANCE_SQUARE_OPENAPI_KEY: ${{ secrets.BINANCE_SQUARE_OPENAPI_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          MAX_RUNTIME_MIN: "345"
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state.json
+          key: coinbot-state-${{ github.run_id }}

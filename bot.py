@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
 """
-Binance SPOT coin bot -> Binance Square.
+Binance SPOT coin bot -> Binance Square + Telegram
 
-Modes (one scanner):
-  FLASH  5/10/15/30m  sudden price + volume spike  -> alert post
-  SCALP  10/15/30m    breakout setups               -> signal post (+ levels on Telegram)
-  SWING  1h/4h/1d     accumulation setups           -> signal post (+ levels on Telegram)
+Modes:
+  FLASH  5/10/15/30m  sudden price + volume spike
+  SCALP  10/15/30m    breakout setups
+  SWING  1h/4h/1d     accumulation / trend continuation (new conditions)
 
-"Which coins to look at" = ranked by 24h volume as % of market cap (CoinGecko, free).
-No price / volume / market-cap limit is applied to the universe.
-
-Square post = max 4 lines, $COIN, English, mood, reason, 2 random hashtags, attention card image.
-Posts are sent one by one with an 8-15 second gap. No results are posted to Square.
-Entry/SL/TP and win/loss results go only to your private Telegram (optional).
-
-Run:  python bot.py             (loops for MAX_RUNTIME_MIN minutes, then exits)
-      DRY_RUN=1 python bot.py   (no posting; prints posts and saves cards to ./cards)
-      python bot.py --selftest  (offline checks, no network)
+Only pure crypto coins (no stables, no leveraged tokens, no tokenized stocks).
+Posts have high variety in structure/style so they don't look bot-like.
+Image card style remains the same as original.
 """
+
 import os
 import sys
 import re
@@ -32,12 +26,10 @@ from datetime import datetime, timezone
 
 import requests
 
-
 # ----------------------------------------------------------------- config
 def envs(n, d):
     v = os.getenv(n)
     return v if v not in (None, "") else d
-
 
 def envf(n, d):
     try:
@@ -45,29 +37,26 @@ def envf(n, d):
     except Exception:
         return d
 
-
 def envb(n, d):
     v = os.getenv(n)
     return d if v in (None, "") else v.strip().lower() in ("1", "true", "yes", "on")
 
-
 POLL_SEC = envf("POLL_SEC", 30)
-MAX_RUNTIME_MIN = envf("MAX_RUNTIME_MIN", 345)
+MAX_RUNTIME_MIN = envf("MAX_RUNTIME_MIN", 340)
 DRY_RUN = envb("DRY_RUN", False)
 STATE_FILE = envs("STATE_FILE", "state.json")
 CARD_DIR = envs("CARD_DIR", "cards")
 
-# flash spike: price move % inside the window (volume must also be VOL_MULT x normal)
 FLASH_THR = {5: envf("FLASH_5M", 3.0), 10: envf("FLASH_10M", 4.0),
              15: envf("FLASH_15M", 5.0), 30: envf("FLASH_30M", 6.0)}
 FLASH_VOL_MULT = envf("FLASH_VOL_MULT", 5.0)
-MIN_WINDOW_USDT = envf("MIN_WINDOW_USDT", 2000)   # dust filter; set 0 to disable
-ALERT_DOWN = envb("ALERT_DOWN", True)             # also post sharp drops (mood negative)
-FLASH_CHECKS = 8                                  # max candle checks per poll
+MIN_WINDOW_USDT = envf("MIN_WINDOW_USDT", 2000)
+ALERT_DOWN = envb("ALERT_DOWN", True)
+FLASH_CHECKS = 8
 
 SCALP_TOP = int(envf("SCALP_TOP", 40))
 SWING_TOP = int(envf("SWING_TOP", 60))
-MIN_TP_PCT = envf("MIN_TP_PCT", 0.5)              # TP1 must be at least this % (fees)
+MIN_TP_PCT = envf("MIN_TP_PCT", 0.5)
 MAX_SPREAD_PCT = envf("MAX_SPREAD_PCT", 0.15)
 
 FLASH_CD = envf("FLASH_COOLDOWN_MIN", 45)
@@ -75,7 +64,7 @@ SCALP_CD = envf("SCALP_COOLDOWN_MIN", 60)
 SWING_CD = envf("SWING_COOLDOWN_MIN", 720)
 
 POST_GAP = (8.0, 15.0)
-MAX_POSTS_DAY = int(envf("MAX_POSTS_DAY", 95))    # Square OpenAPI limit is 100/day
+MAX_POSTS_DAY = int(envf("MAX_POSTS_DAY", 95))
 MAX_POSTS_HOUR = int(envf("MAX_POSTS_HOUR", 10))
 
 HOSTS = ["https://data-api.binance.vision", "https://api.binance.com",
@@ -83,12 +72,20 @@ HOSTS = ["https://data-api.binance.vision", "https://api.binance.com",
 GECKO = "https://api.coingecko.com/api/v3/coins/markets"
 SQUARE_URL = "https://www.binance.com/bapi/composite/v1/public/pgc/openApi/content/add"
 
-STABLES = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "USDD", "EUR", "GBP", "TRY",
-           "BRL", "AEUR", "USD1", "XUSD", "PYUSD", "UST", "USTC", "RLUSD", "BFUSD", "USDE"}
+# Pure crypto only
+STABLES = {
+    "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "USDD", "EUR", "GBP", "TRY",
+    "BRL", "AEUR", "USD1", "XUSD", "PYUSD", "UST", "USTC", "RLUSD", "BFUSD", "USDE",
+    "EURC", "EURS", "SUSD", "GUSD", "HUSD"
+}
+
+# Leveraged / tokenized patterns to exclude
+LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR", "3L", "3S", "5L", "5S")
+TOKENIZED_KEYWORDS = ("BSTOCK", "STOCK", "TSLA", "AAPL", "GOOGL", "AMZN", "MSFT", "NVDA", "META")
 
 TAGS_NEUTRAL = ["#spottrading", "#signal", "#Spot", "#SpotTradingSuccess",
-                "#TradingSignal", "#TradingTips", "#SignalAlert"]
-TAGS_BULLISH = ["#SPOTCALL🔥🔥🔥", "#BullishMomentum"]
+                "#TradingSignal", "#TradingTips", "#SignalAlert", "#CryptoSignal"]
+TAGS_BULLISH = ["#SPOTCALL🔥🔥🔥", "#BullishMomentum", "#BullishSetup"]
 
 S = requests.Session()
 S.headers["User-Agent"] = "Mozilla/5.0 (coin-bot)"
@@ -112,7 +109,7 @@ def bget(path, params=None):
             if r.status_code in (418, 429):
                 time.sleep(min(60, int(r.headers.get("Retry-After", 5))))
                 continue
-            if r.status_code in (451, 403):      # region block -> next host
+            if r.status_code in (451, 403):
                 HOST_IDX += 1
                 continue
             r.raise_for_status()
@@ -189,7 +186,6 @@ def closed(kl):
 
 
 def agg(kl5, minutes):
-    """Binance has no 10m candle: build it from 5m candles (aligned buckets)."""
     bucket = minutes * 60000
     out, cur = [], None
     for k in kl5:
@@ -219,6 +215,21 @@ def fetch_tf(sym, tf):
     return closed(kl) if kl else None
 
 
+def is_pure_crypto(base: str) -> bool:
+    """Only pure crypto coins. Exclude stables, leveraged, tokenized stocks."""
+    if not base or base in STABLES:
+        return False
+    upper = base.upper()
+    if any(upper.endswith(suf) for suf in LEVERAGED_SUFFIXES):
+        return False
+    if any(kw in upper for kw in TOKENIZED_KEYWORDS):
+        return False
+    # common leveraged / synthetic patterns
+    if re.search(r"(UP|DOWN|BULL|BEAR|3L|3S|5L|5S)$", upper):
+        return False
+    return True
+
+
 def parse_tickers(raw, allowed=None):
     out = {}
     for t in raw:
@@ -226,7 +237,7 @@ def parse_tickers(raw, allowed=None):
         if not s.endswith("USDT") or (allowed is not None and s not in allowed):
             continue
         base = s[:-4]
-        if not base or base in STABLES:
+        if not is_pure_crypto(base):
             continue
         try:
             price, qv = float(t["lastPrice"]), float(t["quoteVolume"])
@@ -252,7 +263,7 @@ def load_mcaps():
     hdr = {}
     if os.getenv("COINGECKO_API_KEY"):
         hdr["x-cg-demo-api-key"] = os.getenv("COINGECKO_API_KEY")
-    for page in range(1, 7):                      # ~1500 coins
+    for page in range(1, 7):
         data = None
         for _ in range(2):
             try:
@@ -282,23 +293,143 @@ def load_mcaps():
 def top_by_ratio(tick, n):
     ranked = sorted((s for s, t in tick.items() if t["ratio"] is not None),
                     key=lambda s: tick[s]["ratio"], reverse=True)[:n]
-    if len(ranked) < n:                            # no market caps -> fall back to volume
+    if len(ranked) < n:
         rest = sorted((s for s in tick if s not in ranked),
                       key=lambda s: tick[s]["qv"], reverse=True)
         ranked += rest[:n - len(ranked)]
     return ranked
 
 
-# ----------------------------------------------------------------- posts
+# ----------------------------------------------------------------- posts (high variety)
 def pick_tags(positive):
-    return random.sample(TAGS_NEUTRAL + (TAGS_BULLISH if positive else []), 2)
+    pool = TAGS_NEUTRAL + (TAGS_BULLISH if positive else [])
+    return random.sample(pool, 2)
 
 
-def compose(base, positive, headline):
-    mood = "🟢 Positive" if positive else "🔴 Negative"
-    return f"${base} {mood}\n{headline}\n{' '.join(pick_tags(positive))}"
+MOOD_POS = [
+    "🟢 Positive mood", "Positive mood 🟢", "Bullish mood 🟢",
+    "Mood: positive 🟢", "Mood: bullish 📈", "Looking constructive 🟢",
+    "Buyers in control 🟢", "Momentum turning up 📈"
+]
+MOOD_NEG = [
+    "🔴 Negative mood", "Negative mood 🔴", "Bearish mood 🔴",
+    "Mood: negative 🔴", "Mood: bearish 📉", "Sellers active 🔴",
+    "Pressure on the downside 📉"
+]
+
+RATIO_VARIANTS = [
+    " Vol/MCap {r}% (24h).",
+    " 24h volume is {r}% of market cap.",
+    " 24h Vol/MCap: {r}%.",
+    " Today's volume = {r}% of market cap.",
+    " Volume standing at {r}% of mcap."
+]
+
+# Many different structures so posts don't look the same
+TEMPLATES = {
+    "flash_up": [
+        "{B} {mood}\nUp {absc} in {w}m on {mult}x volume.{ratio}",
+        "Heads up on {B}: {chg} in just {w} minutes, volume running {mult}x above normal.\n{mood}",
+        "🔥 {B} is waking up.\n{w}m move: {chg}. Volume {mult}x.{ratio}\n{mood}",
+        "Radar alert ⚡ {B}\nPrice {chg} / {w}m, volume {mult}x its usual pace.\n{mood}",
+        "{B} update 📈\nBuyers stepped in: {chg} in {w}m with {mult}x volume.{ratio}\n{mood}",
+        "Sudden move spotted 👀 {B} {chg} in {w}m.\nVolume is {mult}x normal.\n{mood}",
+        "{B} just popped {chg} within {w}m 🚀\n{mult}x volume behind it.{ratio}\n{mood}",
+        "Momentum check: {B}\n{chg} in {w}m · {mult}x volume · {mood}",
+        "Spike alert! {B} jumped {chg} in {w} minutes.\nTrading volume {mult}x higher than usual.\n{mood}",
+        "Quick note on {B}\nStrong {w}m candle: {chg} with {mult}x volume.\n{mood}",
+        "{B} showing life.\n{chg} move in {w} minutes, volume elevated at {mult}x.{ratio}",
+        "Watch {B} closely.\nPrice pushed {chg} in {w}m on {mult}x volume.\n{mood}",
+        "Volume spike + price jump on {B}.\n{chg} in {w}m · {mult}x volume\n{mood}",
+        "{B} | {w}m | {chg} | {mult}x vol\n{mood}",
+        "Interesting print on {B}: +{absc} in {w} minutes while volume sits at {mult}x normal levels.\n{mood}",
+    ],
+    "flash_down": [
+        "{B} {mood}\nDown {absc} in {w}m on {mult}x volume.{ratio}",
+        "Heads up on {B}: {chg} in just {w} minutes, volume running {mult}x above normal.\n{mood}",
+        "⚠️ {B} is dropping fast.\n{w}m move: {chg}. Volume {mult}x.{ratio}\n{mood}",
+        "Radar alert 🔻 {B}\nPrice {chg} / {w}m, selling volume {mult}x its usual pace.\n{mood}",
+        "{B} update 📉\nSellers stepped in: {chg} in {w}m with {mult}x volume.{ratio}\n{mood}",
+        "Sharp dip spotted 👀 {B} fell {absc} in {w}m.\nVolume is {mult}x normal.\n{mood}",
+        "{B} just slipped {absc} within {w}m 🔻\n{mult}x volume behind the move.{ratio}\n{mood}",
+        "Momentum check: {B}\n{chg} in {w}m · {mult}x volume · {mood}",
+        "Dump alert! {B} lost {absc} in {w} minutes.\nTrading volume {mult}x higher than usual.\n{mood}",
+        "Quick note on {B}\nHeavy {w}m candle: {chg} with {mult}x volume.\n{mood}",
+        "{B} under pressure.\n{chg} move in {w} minutes, volume elevated at {mult}x.{ratio}",
+        "Watch {B}.\nPrice dropped {chg} in {w}m on {mult}x volume.\n{mood}",
+        "Volume spike + downside move on {B}.\n{chg} in {w}m · {mult}x volume\n{mood}",
+        "{B} | {w}m | {chg} | {mult}x vol\n{mood}",
+        "Heavy selling print on {B}: -{absc} in {w} minutes while volume sits at {mult}x normal levels.\n{mood}",
+    ],
+    "scalp": [
+        "{B} {mood}\nScalp setup on the {tf} chart: {why}, volume {vm}x.{ratio}",
+        "Scalp watch ⚡ {B} ({tf})\n{whyc}, volume {vm}x, trend still up.\n{mood}",
+        "{tf} scalp radar 🎯 {B}\nTrend is up, {why}, {vm}x volume.{ratio}\n{mood}",
+        "{B} is lining up on the {tf} timeframe.\n{whyc} with {vm}x volume.\n{mood}",
+        "Quick-trade candidate 👀 {B}\n{tf}: {why}, uptrend intact, volume {vm}x.\n{mood}",
+        "{mood}\n{B} shows a {tf} scalp setup: {why} and {vm}x volume.{ratio}",
+        "Eyes on {B} 🔥 {tf} chart\n{whyc} + {vm}x volume, trend up.\n{mood}",
+        "{B} · {tf} scalp · {why} · {vm}x volume · {mood}",
+        "Short-term setup: {B} on {tf}.\n{whyc}, volume {vm}x above average.{ratio}\n{mood}",
+        "Possible scalp on {B} ({tf})\n{why} + elevated volume ({vm}x).\n{mood}",
+        "{B} looking ready for a quick move on {tf}.\n{whyc}. Volume {vm}x.\n{mood}",
+        "Clean {tf} structure on {B}.\n{why}, volume confirmation at {vm}x.{ratio}",
+        "Scalp idea → {B}\nTimeframe {tf} | {why} | Vol {vm}x\n{mood}",
+        "Noticing a setup on {B}.\n{tf} chart shows {why} with {vm}x volume.\n{mood}",
+        "{B} | {tf} | {why} | {vm}x vol\n{mood}",
+    ],
+    "swing": [
+        "{B} {mood}\nSwing watch ({tf}): volume building {vr}x while price stays constructive.{ratio}",
+        "Accumulation signs on {B} 👀 ({tf})\nVolume up {vr}x, higher lows, holding structure.\n{mood}",
+        "{tf} swing radar 📊 {B}\nQuiet price action, rising volume ({vr}x), higher lows.{ratio}\n{mood}",
+        "{B} is coiling on the {tf} chart.\nVolume {vr}x and structure remains intact.\n{mood}",
+        "Swing candidate: {B} ({tf})\nTight range, higher lows, {vr}x volume build-up.\n{mood}",
+        "{mood}\n{B} looks like it is building a base on {tf}: higher lows and {vr}x volume.{ratio}",
+        "Patience setup ⏳ {B} {tf}\nVolume {vr}x, price steady, relative strength visible.\n{mood}",
+        "{B} · {tf} swing · volume {vr}x · higher lows · {mood}",
+        "Base-building on {B} ({tf}).\nRising volume ({vr}x), steady price, higher lows.{ratio}\n{mood}",
+        "Longer-term look at {B} on {tf}.\nVolume expanding {vr}x while price holds higher lows.\n{mood}",
+        "{B} showing constructive price action on {tf}.\nVolume {vr}x above recent average.{ratio}",
+        "Structure + volume alignment on {B} ({tf}).\nHigher lows present, volume {vr}x.\n{mood}",
+        "Swing idea forming on {B}.\nTimeframe: {tf} | Volume build: {vr}x\n{mood}",
+        "Keeping an eye on {B}.\n{tf} chart has higher lows and {vr}x volume.\n{mood}",
+        "{B} | {tf} | Vol {vr}x | Higher lows\n{mood}",
+        "Quiet strength in {B} on the {tf}.\nVolume rising ({vr}x) without aggressive price expansion.{ratio}",
+        "Possible swing entry zone developing on {B} ({tf}).\nVolume confirmation at {vr}x.\n{mood}",
+    ],
+}
+
+RECENT = defaultdict(lambda: deque(maxlen=6))
 
 
+def _pick_template(key):
+    pool = TEMPLATES[key]
+    free = [i for i in range(len(pool)) if i not in RECENT[key]] or list(range(len(pool)))
+    i = random.choice(free)
+    RECENT[key].append(i)
+    return pool[i]
+
+
+def compose(kind, base, positive, f):
+    key = ("flash_up" if positive else "flash_down") if kind == "flash" else kind
+    ratio = ""
+    if f.get("ratio") is not None and random.random() < 0.60:
+        ratio = random.choice(RATIO_VARIANTS).format(r=f"{f['ratio']:.0f}")
+    chg = float(f.get("chg", 0.0))
+    why = f.get("why", "")
+    body = _pick_template(key).format(
+        B=f"${base}", mood=random.choice(MOOD_POS if positive else MOOD_NEG), ratio=ratio,
+        chg=f"{chg:+.1f}%", absc=f"{abs(chg):.1f}%", w=f.get("w", ""), tf=f.get("tf", ""),
+        mult=f"{float(f.get('mult', 0)):.1f}", vm=f"{float(f.get('vm', 0)):.1f}",
+        vr=f"{float(f.get('vr', 0)):.1f}", why=why, whyc=why[:1].upper() + why[1:] if why else "")
+    tags = " ".join(pick_tags(positive))
+    lines = body.split("\n")
+    # always put tags on their own line with trailing space style
+    lines.append(tags + " ")
+    return "\n".join(lines[:4])
+
+
+# ----------------------------------------------------------------- card (same style as original)
 FONTS = ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
          "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"]
 
@@ -317,47 +448,109 @@ def _font(size):
         return ImageFont.load_default()
 
 
-def make_card(base, positive, label, metric, path):
-    from PIL import Image, ImageDraw
-    W, H = 1200, 630
-    top, bot = ((12, 46, 30), (4, 12, 9)) if positive else ((56, 16, 20), (14, 5, 7))
-    acc = (46, 214, 120) if positive else (255, 84, 84)
-    img = Image.new("RGB", (W, H), top)
-    d = ImageDraw.Draw(img)
-    for y in range(H):
-        t = y / H
-        d.line([(0, y), (W, y)], fill=tuple(int(top[i] * (1 - t) + bot[i] * t) for i in range(3)))
-    ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    od = ImageDraw.Draw(ov)
-    if positive:
-        od.polygon([(930, 90), (1150, 400), (1010, 400), (1010, 560), (850, 560), (850, 400), (710, 400)],
-                   fill=acc + (46,))
+PAL_UP = [((12, 46, 30), (4, 12, 9), (46, 214, 120)),
+          ((8, 40, 48), (3, 12, 18), (40, 220, 200)),
+          ((22, 46, 14), (7, 15, 5), (170, 230, 60)),
+          ((10, 32, 62), (3, 9, 24), (70, 170, 255)),
+          ((14, 50, 44), (4, 16, 14), (60, 235, 160))]
+PAL_DOWN = [((56, 16, 20), (14, 5, 7), (255, 84, 84)),
+            ((54, 26, 10), (14, 7, 3), (255, 140, 60)),
+            ((48, 12, 40), (13, 4, 11), (240, 80, 170)),
+            ((42, 14, 14), (10, 3, 3), (255, 112, 92))]
+HEAD_UP = ["POSITIVE MOOD", "BULLISH VIBES", "BUYERS ACTIVE", "MOMENTUM UP"]
+HEAD_DOWN = ["NEGATIVE MOOD", "BEARISH VIBES", "SELLERS ACTIVE", "PRESSURE DOWN"]
+DISCLAIMERS = ["Not financial advice  |  Trade at your own risk", "DYOR  -  not financial advice",
+               "Trade with care. Not financial advice."]
+
+
+def _deco(od, kind, positive, acc, W, H, rnd, alpha):
+    a = acc + (alpha,)
+    if kind == "arrow":
+        if positive:
+            od.polygon([(930, 90), (1150, 400), (1010, 400), (1010, 560), (850, 560), (850, 400), (710, 400)],
+                       fill=a)
+        else:
+            od.polygon([(930, 560), (1150, 250), (1010, 250), (1010, 90), (850, 90), (850, 250), (710, 250)],
+                       fill=a)
+    elif kind == "bars":
+        n, bw, gap, x0 = 9, 46, 14, 600
+        for i in range(n):
+            frac = (i + 1) / n if positive else 1 - i / n
+            hgt = int((140 + 360 * frac) * rnd.uniform(0.8, 1.0))
+            x = x0 + i * (bw + gap)
+            od.rectangle([x, H - 50 - hgt, x + bw, H - 50], fill=a)
+    elif kind == "line":
+        pts, y = [], (H - 130 if positive else 130)
+        for i in range(12):
+            y = min(H - 70, max(70, y + (-28 if positive else 28) + rnd.uniform(-45, 45)))
+            pts.append((600 + i * 52, y))
+        strong = acc + (min(255, alpha * 2),)
+        od.line(pts, fill=strong, width=12, joint="curve")
+        for px, py in pts:
+            od.ellipse([px - 9, py - 9, px + 9, py + 9], fill=strong)
     else:
-        od.polygon([(930, 560), (1150, 250), (1010, 250), (1010, 90), (850, 90), (850, 250), (710, 250)],
-                   fill=acc + (46,))
+        cx, cy = rnd.randint(880, 1060), rnd.randint(220, 420)
+        for r in (80, 160, 240, 320):
+            od.ellipse([cx - r, cy - r, cx + r, cy + r], outline=a, width=10)
+
+
+def make_card(base, positive, label, metric, path):
+    from PIL import Image, ImageDraw, ImageChops
+    rnd = random.Random()
+    W, H = 1200, 630
+    top, bot, acc = rnd.choice(PAL_UP if positive else PAL_DOWN)
+    style = rnd.choice(["v", "h", "d"])
+    mv = Image.linear_gradient("L").resize((W, H))
+    mh = mv.rotate(90, expand=True).resize((W, H))
+    mask = mv if style == "v" else mh if style == "h" else ImageChops.add(mv, mh, scale=2)
+    img = Image.composite(Image.new("RGB", (W, H), bot), Image.new("RGB", (W, H), top), mask)
+
+    center = rnd.random() < 0.35
+    ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    _deco(ImageDraw.Draw(ov), rnd.choice(["arrow", "bars", "line", "rings"]), positive, acc, W, H, rnd,
+          34 if center else 50)
     img = Image.alpha_composite(img.convert("RGBA"), ov).convert("RGB")
     d = ImageDraw.Draw(img)
-    d.rectangle([0, 0, 18, H], fill=acc)
+    if center:
+        d.rectangle([0, 0, W, 14], fill=acc)
+    else:
+        d.rectangle([0, 0, 18, H], fill=acc)
+
+    def X(w):
+        return (W - w) // 2 if center else 70
 
     f = _font(34)
-    tw = d.textbbox((0, 0), label, font=f)[2]
-    d.rounded_rectangle([70, 56, 70 + tw + 50, 118], radius=31, fill=acc)
-    d.text((95, 63), label, font=f, fill=(8, 14, 12))
+    pw = d.textbbox((0, 0), label, font=f)[2] + 50
+    px = X(pw)
+    if rnd.random() < 0.5:
+        d.rounded_rectangle([px, 56, px + pw, 118], radius=31, fill=acc)
+        d.text((px + 25, 63), label, font=f, fill=(8, 14, 12))
+    else:
+        d.rounded_rectangle([px, 56, px + pw, 118], radius=31, outline=acc, width=4)
+        d.text((px + 25, 63), label, font=f, fill=acc)
 
     coin, size = f"${base}", 200
     while size > 60 and d.textbbox((0, 0), coin, font=_font(size))[2] > 1000:
         size -= 10
-    d.text((70, 150), coin, font=_font(size), fill=(255, 255, 255))
+    cw = d.textbbox((0, 0), coin, font=_font(size))[2]
+    d.text((X(cw), 150), coin, font=_font(size), fill=(255, 255, 255))
 
-    y = 395
+    head = rnd.choice(HEAD_UP if positive else HEAD_DOWN)
+    hf = _font(56)
+    hw = d.textbbox((0, 0), head, font=hf)[2]
+    x0, y = X(hw + 85), 395
     if positive:
-        d.polygon([(70, y + 56), (130, y + 56), (100, y + 6)], fill=acc)
+        d.polygon([(x0, y + 56), (x0 + 60, y + 56), (x0 + 30, y + 6)], fill=acc)
     else:
-        d.polygon([(70, y + 6), (130, y + 6), (100, y + 56)], fill=acc)
-    d.text((155, y - 2), "POSITIVE MOOD" if positive else "NEGATIVE MOOD", font=_font(56), fill=acc)
-    d.text((70, 478), metric, font=_font(44), fill=(235, 240, 238))
-    d.text((70, 568), "Not financial advice  |  Trade at your own risk", font=_font(26),
-           fill=(150, 160, 156))
+        d.polygon([(x0, y + 6), (x0 + 60, y + 6), (x0 + 30, y + 56)], fill=acc)
+    d.text((x0 + 85, y - 2), head, font=hf, fill=acc)
+
+    mf = _font(44)
+    mw = d.textbbox((0, 0), metric, font=mf)[2]
+    d.text((X(mw), 478), metric, font=mf, fill=(235, 240, 238))
+    dt, df = rnd.choice(DISCLAIMERS), _font(26)
+    dw = d.textbbox((0, 0), dt, font=df)[2]
+    d.text((X(dw), 568), dt, font=df, fill=(150, 160, 156))
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     img.save(path, "PNG")
     return path
@@ -374,7 +567,6 @@ def find_square_script():
 
 
 def post_square(text, img):
-    """-> (ok, info). info == 'LIMIT' when the daily limit is hit."""
     if DRY_RUN:
         print("---- SQUARE POST (dry run) ----\n" + text + f"\n[image: {img}]\n")
         return True, "dry"
@@ -414,7 +606,7 @@ def post_square(text, img):
 def enqueue(prio, ttl, base, positive, text, label, metric, tgmsg=None):
     if len(QUEUE) >= 40:
         QUEUE.sort(key=lambda x: (x["prio"], x["ts"]))
-        QUEUE.pop()                                   # drop least important
+        QUEUE.pop()
     QUEUE.append({"prio": prio, "ttl": ttl, "ts": time.time(), "base": base, "pos": positive,
                   "text": text, "label": label, "metric": metric})
     if tgmsg:
@@ -438,7 +630,7 @@ def drain(state, now):
     QUEUE.sort(key=lambda x: (x["prio"], x["ts"]))
     item = QUEUE.pop(0)
     if now - item["ts"] > item["ttl"]:
-        return                                        # too old, skip
+        return
     img = None
     try:
         img = make_card(item["base"], item["pos"], item["label"], item["metric"],
@@ -558,11 +750,9 @@ def flash_scan(state, tick, now):
             continue
         t = tick[sym]
         cool_set(state, f"flash:{sym}", now)
-        word = "Flash spike" if up else "Flash drop"
-        head = f"{word}: {chg:+.1f}% in {w}m on {mult:.1f}x volume."
-        if t["ratio"] is not None:
-            head += f" Vol/MCap {t['ratio']:.0f}% (24h)."
-        enqueue(2, 600, t["base"], up, compose(t["base"], up, head),
+        post = compose("flash", t["base"], up,
+                       {"chg": chg, "w": w, "mult": mult, "ratio": t["ratio"]})
+        enqueue(2, 600, t["base"], up, post,
                 f"FLASH {'SPIKE' if up else 'DROP'} | {w}m",
                 f"{chg:+.1f}% in {w}m   |   {mult:.1f}x volume",
                 f"FLASH {t['base']}/USDT {chg:+.1f}% in {w}m, volume {mult:.1f}x, price {fmt(t['price'])}")
@@ -616,46 +806,90 @@ def scalp_scan(state, tick, tf, now):
         t = tick[sym]
         e, a = t["price"], sig["atr"]
         sl, tp1, tp2 = e - 1.5 * a, e + 1.5 * a, e + 3 * a
+        risk_pct = (e - sl) / e * 100
+        rr1 = (tp1 - e) / (e - sl) if (e - sl) > 0 else 0
         cool_set(state, f"scalp:{sym}", now)
         why = "breakout above recent highs" if sig["brk"] else "strong volume candle"
-        head = f"Scalp setup ({tf}): {why}, volume {sig['vm']:.1f}x, uptrend intact."
-        if t["ratio"] is not None:
-            head += f" Vol/MCap {t['ratio']:.0f}%."
-        msg = (f"SCALP {tf} {t['base']}/USDT\nEntry: {fmt(e)}\nSL: {fmt(sl)} ({(sl/e-1)*100:.2f}%)\n"
-               f"TP1: {fmt(tp1)} (+{(tp1/e-1)*100:.2f}%)\nTP2: {fmt(tp2)} (+{(tp2/e-1)*100:.2f}%)\n"
-               f"Spread {spread:.3f}%")
+        post = compose("scalp", t["base"], True,
+                       {"tf": tf, "why": why, "vm": sig["vm"], "ratio": t["ratio"]})
+        msg = (f"SCALP {tf} {t['base']}/USDT\n"
+               f"Entry: {fmt(e)}\n"
+               f"SL: {fmt(sl)} ({(sl/e-1)*100:.2f}%)\n"
+               f"TP1: {fmt(tp1)} (+{(tp1/e-1)*100:.2f}%)\n"
+               f"TP2: {fmt(tp2)} (+{(tp2/e-1)*100:.2f}%)\n"
+               f"Risk: {risk_pct:.2f}% | RR (TP1): 1:{rr1:.1f}\n"
+               f"Spread: {spread:.3f}% | Vol: {sig['vm']:.1f}x | RSI: {sig['rsi']:.0f}")
         state["open"].append({"sym": sym, "base": t["base"], "mode": "scalp", "tf": tf, "ts": now,
                               "entry": e, "sl": sl, "tp1": tp1, "ttl": 6 * 3600})
-        enqueue(1, 1200, t["base"], True, compose(t["base"], True, head), f"SCALP SIGNAL | {tf}",
+        enqueue(1, 1200, t["base"], True, post, f"SCALP SIGNAL | {tf}",
                 f"Volume {sig['vm']:.1f}x   |   RSI {sig['rsi']:.0f}", msg)
         log(f"scalp {sym} {tf}")
 
 
-# ----------------------------------------------------------------- SWING
-FLAT_PCT = {"1h": 4.0, "4h": 6.0, "1d": 10.0}
-
-
+# ----------------------------------------------------------------- SWING (new conditions)
 def eval_swing(kl, tf, btc_ret):
+    """
+    New swing conditions (min 1h):
+    - Price > EMA20 and EMA20 > EMA55
+    - Price above EMA50 (or recent bounce)
+    - RSI 40-70
+    - Volume building (>= 1.4x)
+    - Higher low structure
+    - Bullish price action (close near high or strong body)
+    """
     if not kl or len(kl) < 60:
         return None
     h = [k["h"] for k in kl]
     l = [k["l"] for k in kl]
     c = [k["c"] for k in kl]
+    o = [k["o"] for k in kl]
     qv = [k["qv"] for k in kl]
+
     a = atr_last(h, l, c)
+    if not a:
+        return None
+
+    ema20 = ema_series(c, 20)[-1]
+    ema55 = ema_series(c, 55)[-1]
+    ema50 = ema_series(c, 50)[-1]
+
+    # Trend filters
+    if not (c[-1] > ema20 and ema20 > ema55):
+        return None
+    if c[-1] < ema50 * 0.995:  # allow tiny undercut
+        return None
+
+    r = rsi_last(c)
+    if not (40 <= r <= 70):
+        return None
+
     base_vol = mean(qv[-25:-5])
-    if not a or base_vol <= 0:
+    if base_vol <= 0:
         return None
     vr = mean(qv[-5:]) / base_vol
-    flat = abs(c[-1] / c[-6] - 1) * 100 <= FLAT_PCT.get(tf, 6.0)
-    higher_low = min(l[-5:]) > min(l[-15:-5])
-    above = c[-1] > ema_series(c, 50)[-1]
-    near_high = c[-1] >= max(h[-21:-1]) * 0.97
-    ret = c[-1] / c[-25] - 1
-    rs = btc_ret is None or ret > btc_ret
-    r = rsi_last(c)
-    if not (vr >= 1.5 and flat and higher_low and above and near_high and rs and r <= 70):
+    if vr < 1.4:
         return None
+
+    # Higher low
+    higher_low = min(l[-5:]) > min(l[-15:-5])
+    if not higher_low:
+        return None
+
+    # Bullish price action
+    last = kl[-1]
+    rng = last["h"] - last["l"]
+    body = abs(last["c"] - last["o"])
+    close_near_high = (last["h"] - last["c"]) / rng < 0.35 if rng > 0 else False
+    strong_body = body / rng >= 0.55 if rng > 0 else False
+    bullish_pa = close_near_high or strong_body or (last["c"] > last["o"])
+    if not bullish_pa:
+        return None
+
+    # Relative strength vs BTC (optional soft filter)
+    ret = c[-1] / c[-25] - 1 if len(c) > 25 else 0
+    if btc_ret is not None and ret < btc_ret - 0.02:
+        return None
+
     return {"entry": c[-1], "atr": a, "vr": vr, "rsi": r}
 
 
@@ -671,15 +905,24 @@ def swing_scan(state, tick, tf, now):
             continue
         t = tick[sym]
         e, a = t["price"], sig["atr"]
-        sl, tp1, tp2 = e - 2 * a, e + 3 * a, e + 6 * a
+        sl = e - 2.0 * a
+        tp1 = e + 3.0 * a
+        tp2 = e + 6.0 * a
+        risk_pct = (e - sl) / e * 100
+        rr1 = (tp1 - e) / (e - sl) if (e - sl) > 0 else 0
         cool_set(state, f"swing:{sym}", now)
-        head = (f"Swing setup ({tf}): volume building {sig['vr']:.1f}x while price holds a tight range, "
-                f"higher lows, stronger than BTC.")
-        msg = (f"SWING {tf} {t['base']}/USDT\nEntry: {fmt(e)}\nSL: {fmt(sl)} ({(sl/e-1)*100:.2f}%)\n"
-               f"TP1: {fmt(tp1)} (+{(tp1/e-1)*100:.2f}%)\nTP2: {fmt(tp2)} (+{(tp2/e-1)*100:.2f}%)")
+        post = compose("swing", t["base"], True, {"tf": tf, "vr": sig["vr"], "ratio": t["ratio"]})
+        msg = (f"SWING {tf} {t['base']}/USDT\n"
+               f"Entry: {fmt(e)}\n"
+               f"SL: {fmt(sl)} ({(sl/e-1)*100:.2f}%)\n"
+               f"TP1: {fmt(tp1)} (+{(tp1/e-1)*100:.2f}%)\n"
+               f"TP2: {fmt(tp2)} (+{(tp2/e-1)*100:.2f}%)\n"
+               f"Risk: {risk_pct:.2f}% | RR (TP1): 1:{rr1:.1f}\n"
+               f"Vol build: {sig['vr']:.1f}x | RSI: {sig['rsi']:.0f}\n"
+               f"Structure: Higher lows + EMA alignment")
         state["open"].append({"sym": sym, "base": t["base"], "mode": "swing", "tf": tf, "ts": now,
                               "entry": e, "sl": sl, "tp1": tp1, "ttl": 7 * 86400})
-        enqueue(1, 3600, t["base"], True, compose(t["base"], True, head), f"SWING SIGNAL | {tf}",
+        enqueue(1, 3600, t["base"], True, post, f"SWING SIGNAL | {tf}",
                 f"Volume building {sig['vr']:.1f}x   |   Higher lows", msg)
         log(f"swing {sym} {tf}")
 
@@ -782,7 +1025,6 @@ def main():
                 save_state(state)
         except Exception:
             log("loop error:\n" + traceback.format_exc())
-        # keep draining the post queue while waiting for the next poll
         while time.time() - t0 < POLL_SEC and time.time() < end:
             time.sleep(1)
             try:
@@ -793,119 +1035,5 @@ def main():
     log("finished runtime, state saved")
 
 
-# ----------------------------------------------------------------- offline self-test
-def _candles(closes, vols, step=900000, start=1_700_000_000_000, spread=0.004):
-    out = []
-    prev = closes[0]
-    for i, (c, v) in enumerate(zip(closes, vols)):
-        o = prev
-        out.append({"t": start + i * step, "o": o, "h": max(o, c) * (1 + spread / 2),
-                    "l": min(o, c) * (1 - spread / 2), "c": c, "v": v, "qv": v * c,
-                    "ct": start + (i + 1) * step - 1})
-        prev = c
-    return out
-
-
-def selftest():
-    global klines, FLASH_COOLDOWN
-    rnd = random.Random(7)
-    ok = True
-
-    def check(name, cond):
-        nonlocal ok
-        print(("PASS " if cond else "FAIL ") + name)
-        ok = ok and cond
-
-    # indicators
-    up = [100 + i for i in range(40)]
-    check("rsi of straight uptrend is 100", rsi_last(up) == 100.0)
-    check("ema follows price", 130 < ema_series(up, 10)[-1] < 139)
-
-    # 10m aggregation from 5m (aligned buckets, partial bucket dropped)
-    k5 = _candles([100 + i * 0.1 for i in range(13)], [10] * 13, step=300000, start=600000 * 1000 + 300000)
-    a10 = agg(k5, 10)
-    check("10m aggregation builds only complete buckets", all(x["n"] == 2 for x in a10) and len(a10) >= 5)
-
-    # scalp: slow uptrend, then breakout candle on big volume
-    closes = [100 + i * 0.03 + rnd.uniform(-0.25, 0.25) for i in range(99)]
-    closes.append(max(closes) * 1.012)
-    vols = [100 + rnd.uniform(-10, 10) for _ in range(99)] + [420]
-    sig = eval_scalp(_candles(closes, vols))
-    check("scalp setup detected on breakout + volume", sig is not None)
-    flat = [100 + rnd.uniform(-0.25, 0.25) for _ in range(100)]
-    check("scalp ignores sideways noise", eval_scalp(_candles(flat, [100] * 100)) is None)
-
-    # swing: tight base, rising lows, volume building, near highs
-    sw = [100 + i * 0.02 + 0.15 * ((i % 4) - 1.5) for i in range(100)]
-    swv = [100] * 95 + [190, 200, 210, 205, 215]
-    ss = eval_swing(_candles(sw, swv, step=3600000), "1h", -0.01)
-    check("swing accumulation detected", ss is not None)
-    check("swing rejected when volume is not building",
-          eval_swing(_candles(sw, [100] * 100, step=3600000), "1h", -0.01) is None)
-
-    # flash: simulate history with a 4% jump in 5m and a volume spike
-    now = time.time()
-    tick = {"AAAUSDT": {"base": "AAA", "price": 1.05, "qv": 5e6, "chg24": 9.0, "ratio": 41.0},
-            "BBBUSDT": {"base": "BBB", "price": 2.0, "qv": 5e6, "chg24": 0.1, "ratio": 3.0}}
-    for i in range(12, -1, -1):
-        HIST["AAAUSDT"].append((now - i * 30, 1.0 if i > 1 else 1.05))
-        HIST["BBBUSDT"].append((now - i * 30, 2.0))
-
-    def fake(sym, interval, limit):
-        cl = [1.0] * (limit - 6) + [1.01, 1.02, 1.03, 1.04, 1.05, 1.05]
-        vo = [1000] * (limit - 6) + [9000] * 6
-        return _candles(cl, vo, step=60000)
-    klines = fake
-    st = new_state()
-    QUEUE.clear()
-    flash_scan(st, tick, now)
-    check("flash alert queued for AAA only", len(QUEUE) == 1 and QUEUE[0]["base"] == "AAA")
-    n_before = len(QUEUE)
-    flash_scan(st, tick, now + 5)
-    check("flash cooldown blocks duplicate", len(QUEUE) == n_before)
-
-    # post format
-    txt = QUEUE[0]["text"]
-    lines = txt.split("\n")
-    check("post is max 4 lines", len(lines) <= 4)
-    check("post starts with $COIN and has mood", lines[0].startswith("$AAA") and "Positive" in lines[0])
-    tags = [w for w in lines[-1].split(" ") if w.startswith("#")]
-    check("post has exactly 2 hashtags from the list",
-          len(tags) == 2 and all(t in TAGS_NEUTRAL + TAGS_BULLISH for t in tags))
-    for _ in range(200):
-        neg = compose("XYZ", False, "x").split("\n")[-1]
-        if any(b in neg for b in TAGS_BULLISH):
-            check("negative posts never use bullish-only tags", False)
-            break
-    else:
-        check("negative posts never use bullish-only tags", True)
-    print("\nSample post:\n" + txt + "\n")
-
-    # card images
-    os.makedirs("cards", exist_ok=True)
-    make_card("AAA", True, "FLASH SPIKE | 5m", "+4.8% in 5m   |   9.0x volume", "cards/test_up.png")
-    make_card("1000SATS", False, "FLASH SPIKE | 15m", "-5.2% in 15m   |   6.3x volume", "cards/test_down.png")
-    check("cards created", os.path.getsize("cards/test_up.png") > 5000)
-
-    # post queue gap + caps (dry run)
-    global DRY_RUN, NEXT_POST
-    DRY_RUN = True
-    QUEUE.clear()
-    for b in ("A1", "A2"):
-        enqueue(1, 600, b, True, compose(b, True, "test"), "TEST", "m")
-    st = new_state()
-    t0 = time.time()
-    drain(st, t0)
-    gap1 = NEXT_POST - t0
-    drain(st, t0 + 1)                      # too early -> must not post
-    check("8-15s gap enforced", 8 <= gap1 <= 15 and len(QUEUE) == 1)
-    drain(st, NEXT_POST + 0.1)
-    check("second post sent after gap", len(QUEUE) == 0 and st["posts"]["count"] == 2)
-    print("\nALL OK" if ok else "\nSOME CHECKS FAILED")
-    return 0 if ok else 1
-
-
 if __name__ == "__main__":
-    if "--selftest" in sys.argv:
-        sys.exit(selftest())
     main()

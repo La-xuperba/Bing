@@ -418,7 +418,7 @@ def compose(kind, base, positive, f):
     chg = float(f.get("chg", 0.0))
     why = f.get("why", "")
     body = _pick_template(key).format(
-        B=f"${base}", mood=random.choice(MOOD_POS if positive else MOOD_NEG), ratio=ratio,
+        B=f"${base} ", mood=random.choice(MOOD_POS if positive else MOOD_NEG), ratio=ratio,
         chg=f"{chg:+.1f}%", absc=f"{abs(chg):.1f}%", w=f.get("w", ""), tf=f.get("tf", ""),
         mult=f"{float(f.get('mult', 0)):.1f}", vm=f"{float(f.get('vm', 0)):.1f}",
         vr=f"{float(f.get('vr', 0)):.1f}", why=why, whyc=why[:1].upper() + why[1:] if why else "")

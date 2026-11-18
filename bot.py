@@ -20,6 +20,7 @@ import time
 import random
 import subprocess
 import glob
+import shutil
 import traceback
 from collections import deque, defaultdict
 from datetime import datetime, timezone
@@ -51,13 +52,16 @@ FLASH_THR = {5: envf("FLASH_5M", 3.0), 10: envf("FLASH_10M", 4.0),
              15: envf("FLASH_15M", 5.0), 30: envf("FLASH_30M", 6.0)}
 FLASH_VOL_MULT = envf("FLASH_VOL_MULT", 5.0)
 MIN_WINDOW_USDT = envf("MIN_WINDOW_USDT", 2000)
-ALERT_DOWN = envb("ALERT_DOWN", True)
+ALERT_DOWN = envb("ALERT_DOWN", False)
 FLASH_CHECKS = 8
 
 SCALP_TOP = int(envf("SCALP_TOP", 40))
 SWING_TOP = int(envf("SWING_TOP", 60))
 MIN_TP_PCT = envf("MIN_TP_PCT", 0.5)
 MAX_SPREAD_PCT = envf("MAX_SPREAD_PCT", 0.15)
+MIN_CONF = int(envf("MIN_CONF", 4))                # extra checks that must pass (scalp/swing)
+BTC_MAX_DROP = envf("BTC_MAX_DROP", 1.0)           # BTC 1h drop (%) that blocks scalp/swing signals
+REQUIRE_IMAGE = envb("REQUIRE_IMAGE", False)       # True = never post without the image card
 
 FLASH_CD = envf("FLASH_COOLDOWN_MIN", 45)
 SCALP_CD = envf("SCALP_COOLDOWN_MIN", 60)
@@ -177,7 +181,7 @@ def klines(symbol, interval, limit):
     if not d:
         return None
     return [{"t": k[0], "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
-             "c": float(k[4]), "v": float(k[5]), "qv": float(k[7]), "ct": k[6]} for k in d]
+             "c": float(k[4]), "v": float(k[5]), "qv": float(k[7]), "tb": float(k[10]), "ct": k[6]} for k in d]
 
 
 def closed(kl):
@@ -200,6 +204,7 @@ def agg(kl5, minutes):
             cur["c"] = k["c"]
             cur["v"] += k["v"]
             cur["qv"] += k["qv"]
+            cur["tb"] = cur.get("tb", 0.0) + k.get("tb", 0.0)
             cur["ct"] = k["ct"]
             cur["n"] += 1
     if cur:
@@ -211,7 +216,7 @@ def fetch_tf(sym, tf):
     if tf == "10m":
         kl = klines(sym, "5m", 300)
         return agg(closed(kl), 10) if kl else None
-    kl = klines(sym, tf, 150)
+    kl = klines(sym, tf, 210)
     return closed(kl) if kl else None
 
 
@@ -324,6 +329,7 @@ RATIO_VARIANTS = [
     " Today's volume = {r}% of market cap.",
     " Volume standing at {r}% of mcap."
 ]
+CHECK_VARIANTS = [" Checked: {c}.", " Confirmed by {c}.", " Aligned: {c}.", " In line: {c}."]
 
 # Many different structures so posts don't look the same
 TEMPLATES = {
@@ -410,23 +416,39 @@ def _pick_template(key):
     return pool[i]
 
 
+def space_after_coin(text):
+    """Binance Square turns $COIN into a coin tag only when a space (or line end) follows the name.
+    Makes sure every $COIN is followed by exactly one space and drops punctuation glued to it."""
+    text = re.sub(r"(\$[A-Za-z0-9]+)[:.,;!?]+(?=\s|$)", r"\1", text)   # "$AAA:" -> "$AAA"
+    text = re.sub(r"(\$[A-Za-z0-9]+)(?=\s|$)", r"\1 ", text)            # "$AAA" -> "$AAA "
+    return re.sub(r"(\$[A-Za-z0-9]+)  +", r"\1 ", text)                 # never two spaces
+
+
 def compose(kind, base, positive, f):
     key = ("flash_up" if positive else "flash_down") if kind == "flash" else kind
     ratio = ""
-    if f.get("ratio") is not None and random.random() < 0.60:
+    names = list(f.get("checks") or [])
+    if names and random.random() < 0.5:
+        pick = random.sample(names, min(5, len(names)))
+        pick.sort(key=names.index)
+        ratio = random.choice(CHECK_VARIANTS).format(c=", ".join(pick))
+    elif f.get("ratio") is not None and random.random() < 0.60:
         ratio = random.choice(RATIO_VARIANTS).format(r=f"{f['ratio']:.0f}")
     chg = float(f.get("chg", 0.0))
     why = f.get("why", "")
-    body = _pick_template(key).format(
-        B=f"${base} ", mood=random.choice(MOOD_POS if positive else MOOD_NEG), ratio=ratio,
+    tpl = _pick_template(key)
+    if "{mood}" not in tpl:                         # every post must say if the mood is positive/negative
+        tpl += "\n{mood}"
+    body = tpl.format(
+        B=f"${base}", mood=random.choice(MOOD_POS if positive else MOOD_NEG), ratio=ratio,
         chg=f"{chg:+.1f}%", absc=f"{abs(chg):.1f}%", w=f.get("w", ""), tf=f.get("tf", ""),
         mult=f"{float(f.get('mult', 0)):.1f}", vm=f"{float(f.get('vm', 0)):.1f}",
         vr=f"{float(f.get('vr', 0)):.1f}", why=why, whyc=why[:1].upper() + why[1:] if why else "")
-    tags = " ".join(pick_tags(positive))
+    tags = pick_tags(positive) + [f"#{base}"]          # 2 random hashtags + the coin's own hashtag
+    random.shuffle(tags)
     lines = body.split("\n")
-    # always put tags on their own line with trailing space style
-    lines.append(tags + " ")
-    return "\n".join(lines[:4])
+    lines.append(" ".join(tags) + " ")
+    return space_after_coin("\n".join(lines[:4]))
 
 
 # ----------------------------------------------------------------- card (same style as original)
@@ -560,10 +582,68 @@ def square_key():
     return os.getenv("BINANCE_SQUARE_OPENAPI_KEY") or os.getenv("SQUARE_API_KEY") or ""
 
 
+IMG_ERR = {"ts": 0.0}
+
+
+def note_image_error(msg):
+    """Log it, and tell Telegram (at most every 30 min) why a post went out without its image."""
+    log("IMAGE PROBLEM:", msg[:900].replace("\n", " "))
+    now = time.time()
+    if now - IMG_ERR["ts"] > 1800:
+        IMG_ERR["ts"] = now
+        tg("Binance Square: a post went out WITHOUT its image.\nReason: " + msg[:1500])
+
+
 def find_square_script():
     d = envs("SQUARE_SKILL_DIR", "square-skill")
-    hits = glob.glob(os.path.join(d, "**", "post-image.mjs"), recursive=True)
+    hits = sorted(glob.glob(os.path.join(d, "**", "post-image.mjs"), recursive=True),
+                  key=lambda p: (0 if "square-post" in p else 1, len(p)))
     return os.path.abspath(hits[0]) if hits else None
+
+
+def _run_square_script(script, text, img_arg, cwd, env):
+    p = subprocess.run(["node", script, "--text", text, "--images", img_arg],
+                       capture_output=True, text=True, timeout=180, env=env, cwd=cwd)
+    out = ((p.stdout or "") + (p.stderr or "")).strip()
+    return (p.returncode == 0 or "Success" in out), out
+
+
+def post_image_square(text, img, key):
+    """Binance's official post-image.mjs, tried two ways: (1) png, run from the skill folder,
+    (2) jpg copy, run from the image folder. -> (ok, info, error_text)"""
+    script = find_square_script()
+    if not script:
+        return False, "", "post-image.mjs not found (square-skill clone failed?)"
+    if not shutil.which("node"):
+        return False, "", "node is not installed on this machine"
+    env = dict(os.environ, BINANCE_SQUARE_OPENAPI_KEY=key)
+    png = os.path.abspath(img)
+    attempts = [("png, from skill folder", png, os.path.dirname(os.path.dirname(script)))]
+    jpg = os.path.splitext(png)[0] + ".jpg"
+    try:
+        from PIL import Image
+        Image.open(png).convert("RGB").save(jpg, "JPEG", quality=92)
+        attempts.append(("jpg, from image folder", os.path.basename(jpg), os.path.dirname(jpg)))
+    except Exception as e:
+        log("jpg copy skipped:", e)
+    errs = []
+    try:
+        for name, arg, cwd in attempts:
+            try:
+                ok, out = _run_square_script(script, text, arg, cwd, env)
+            except Exception as e:
+                ok, out = False, f"exception: {e}"
+            if ok:
+                return True, "image", ""
+            if "220009" in out:
+                return False, "LIMIT", out
+            errs.append(f"[{name}] {out[-450:]}")
+    finally:
+        try:
+            os.remove(jpg)
+        except Exception:
+            pass
+    return False, "", " | ".join(errs)
 
 
 def post_square(text, img):
@@ -573,21 +653,15 @@ def post_square(text, img):
     key = square_key()
     if not key:
         return False, "no BINANCE_SQUARE_OPENAPI_KEY"
-    env = dict(os.environ, BINANCE_SQUARE_OPENAPI_KEY=key)
-    script = find_square_script()
-    if script and img and os.path.exists(img):
-        try:
-            p = subprocess.run(["node", script, "--text", text, "--images", os.path.abspath(img)],
-                               capture_output=True, text=True, timeout=120, env=env,
-                               cwd=os.path.dirname(os.path.dirname(script)))
-            out = (p.stdout or "") + (p.stderr or "")
-            if p.returncode == 0 or "Success" in out:
-                return True, "image"
-            if "220009" in out:
-                return False, "LIMIT"
-            log("image post failed, trying text only:", out[-200:].replace("\n", " "))
-        except Exception as e:
-            log("image post error, trying text only:", e)
+    if img and os.path.exists(img):
+        ok, info, err = post_image_square(text, img, key)
+        if ok:
+            return True, "image"
+        if info == "LIMIT":
+            return False, "LIMIT"
+        note_image_error(err)
+        if REQUIRE_IMAGE:
+            return False, "image failed (REQUIRE_IMAGE is on, not posting text-only)"
     try:
         r = S.post(SQUARE_URL, json={"bodyTextOnly": text}, timeout=25, headers={
             "X-Square-OpenAPI-Key": key, "Content-Type": "application/json",
@@ -636,7 +710,7 @@ def drain(state, now):
         img = make_card(item["base"], item["pos"], item["label"], item["metric"],
                         os.path.join(CARD_DIR, f"{item['base']}_{int(now)}.png"))
     except Exception as e:
-        log("card error (posting text only):", e)
+        note_image_error(f"card creation failed: {e}")
     ok, info = post_square(item["text"], img)
     if ok:
         p["count"] += 1
@@ -711,7 +785,8 @@ def flash_confirm(sym, w):
     bpm = mean([k["qv"] for k in base])
     mult = (vw / w) / bpm if bpm > 0 else 99.0
     chg = (kl[-1]["c"] / win[0]["o"] - 1) * 100
-    return {"chg": chg, "mult": mult, "vw": vw}
+    tbw = sum(k.get("tb", 0.0) for k in win)
+    return {"chg": chg, "mult": mult, "vw": vw, "buy": (tbw / vw) if vw > 0 and tbw > 0 else None}
 
 
 def flash_scan(state, tick, now):
@@ -748,15 +823,193 @@ def flash_scan(state, tick, now):
             continue
         if not up and not ALERT_DOWN:
             continue
+        if up and (not btc_state(now)["calm"] or (info["buy"] is not None and info["buy"] < 0.5)):
+            STATS["flash:rejected (BTC dumping or sellers dominate)"] += 1
+            continue
         t = tick[sym]
         cool_set(state, f"flash:{sym}", now)
+        names = ["Volume"] + (["Buyers"] if info["buy"] is not None else []) + ["BTC"]
         post = compose("flash", t["base"], up,
-                       {"chg": chg, "w": w, "mult": mult, "ratio": t["ratio"]})
+                       {"chg": chg, "w": w, "mult": mult, "ratio": t["ratio"], "checks": names})
         enqueue(2, 600, t["base"], up, post,
                 f"FLASH {'SPIKE' if up else 'DROP'} | {w}m",
                 f"{chg:+.1f}% in {w}m   |   {mult:.1f}x volume",
                 f"FLASH {t['base']}/USDT {chg:+.1f}% in {w}m, volume {mult:.1f}x, price {fmt(t['price'])}")
         log(f"flash {sym} {chg:+.1f}% {w}m vol {mult:.1f}x")
+
+
+# ----------------------------------------------------------------- confluence: all checks before a signal post
+STATS = defaultdict(int)
+BTC = {"ts": 0.0, "ok": True, "calm": True, "chg1h": 0.0}
+BTC_TF = {}
+FNG = {"ts": 0.0, "val": None}
+
+
+def sma(vals, n):
+    return mean(vals[-n:]) if len(vals) >= n else None
+
+
+def btc_state(now):
+    """BTC position: ok = not dumping and not under its 15m EMA21; calm = not crashing. Cached 60s."""
+    if now - BTC["ts"] < 60:
+        return BTC
+    BTC["ts"] = now
+    kl = klines("BTCUSDT", "15m", 60)
+    if kl and len(kl) > 30:
+        c = [k["c"] for k in closed(kl)]
+        BTC["chg1h"] = (c[-1] / c[-5] - 1) * 100
+        BTC["calm"] = BTC["chg1h"] > -2.0
+        BTC["ok"] = BTC["chg1h"] >= -BTC_MAX_DROP and c[-1] >= ema_series(c, 21)[-1] * 0.995
+    return BTC
+
+
+def btc_tf_ret(tf, now):
+    """BTC return over the last 12 candles of this timeframe (cached 60s)."""
+    ts, val = BTC_TF.get(tf, (0.0, None))
+    if now - ts > 60:
+        kl = fetch_tf("BTCUSDT", tf)
+        val = (kl[-1]["c"] / kl[-13]["c"] - 1) if kl and len(kl) > 14 else None
+        BTC_TF[tf] = (now, val)
+    return val
+
+
+def fng_state(now):
+    """Crypto Fear & Greed index 0-100 (alternative.me, free). None if unavailable."""
+    if now - FNG["ts"] > 3600:
+        FNG["ts"] = now
+        try:
+            r = S.get("https://api.alternative.me/fng/?limit=1", timeout=15)
+            FNG["val"] = int(r.json()["data"][0]["value"])
+        except Exception:
+            pass
+    return FNG["val"]
+
+
+def book_ratio(sym):
+    """Bid depth / ask depth within 1% of the best price. None if unavailable."""
+    d = bget("/api/v3/depth", {"symbol": sym, "limit": 100})
+    try:
+        bids = [(float(p), float(q)) for p, q in d["bids"]]
+        asks = [(float(p), float(q)) for p, q in d["asks"]]
+        bv = sum(p * q for p, q in bids if p >= bids[0][0] * 0.99)
+        av = sum(p * q for p, q in asks if p <= asks[0][0] * 1.01)
+        return bv / av if av > 0 else None
+    except Exception:
+        return None
+
+
+def fib_check(h, l, c, a):
+    """Bullish Fibonacci: price is at/near the swing high (breakout), or it holds above the 50%
+    retracement of the last up-move without ever dipping below the 61.8% level."""
+    n = min(len(c), 80)
+    hh, ll = h[-n:], l[-n:]
+    lo = min(ll)
+    i = ll.index(lo)
+    if i >= n - 5:
+        return False
+    hi = max(hh[i:])
+    if hi - lo < 2 * a:
+        return False
+    if c[-1] >= hi - 0.5 * a:
+        return True
+    l50, l618 = hi - 0.5 * (hi - lo), hi - 0.618 * (hi - lo)
+    return c[-1] >= l50 and min(ll[-8:]) >= l618
+
+
+def fvg_check(h, l, c, a, look=24):
+    """Bullish Fair Value Gap still unfilled under price (support), and no unfilled bearish gap
+    sitting just above price (resistance)."""
+    n = len(c)
+    support = block = False
+    for i in range(max(2, n - look), n):
+        if l[i] > h[i - 2] and (l[i] - h[i - 2]) >= 0.2 * a:
+            gb, gt = h[i - 2], l[i]
+            later = l[i + 1:]
+            if (min(later) if later else gt) > gb and c[-1] > gt:
+                support = True
+        if h[i] < l[i - 2] and (l[i - 2] - h[i]) >= 0.2 * a:
+            gb, gt = h[i], l[i - 2]
+            later = h[i + 1:]
+            if (max(later) if later else gb) < gt and 0 < gt - c[-1] < a:
+                block = True
+    return support and not block
+
+
+def confluence(kl, tf, mode, sym, now):
+    """All checks on one candidate. Core checks must all pass, plus MIN_CONF of the extra ones."""
+    h = [k["h"] for k in kl]
+    l = [k["l"] for k in kl]
+    c = [k["c"] for k in kl]
+    qv = [k["qv"] for k in kl]
+    a = atr_last(h, l, c) or 0.0
+    passed, failed = [], []
+
+    def mark(name, cond):
+        if cond is not None:
+            (passed if cond else failed).append(name)
+
+    # core: EMA trend, RSI, volume, BTC not dumping
+    r = rsi_last(c)
+    if mode == "scalp":
+        e9, e21 = ema_series(c, 9)[-1], ema_series(c, 21)[-1]
+        ema_ok = c[-1] > e21 and e9 > e21
+        rsi_ok = 50 <= r <= 80
+        base = mean(qv[-21:-1])
+        vol_ok = base > 0 and qv[-1] >= 1.8 * base
+    else:
+        e20, e55 = ema_series(c, 20)[-1], ema_series(c, 55)[-1]
+        ema_ok = c[-1] > e20 and e20 > e55
+        rsi_ok = 40 <= r <= 70
+        base = mean(qv[-25:-5])
+        vol_ok = base > 0 and mean(qv[-5:]) >= 1.4 * base
+    bs = btc_state(now)
+    core = [("EMA", ema_ok), ("RSI", rsi_ok), ("Volume", vol_ok), ("BTC", bs["ok"])]
+    for name, cond in core:
+        mark(name, cond)
+    core_ok = all(cond for _, cond in core)
+
+    # extra: MA, Fibonacci, FVG, buyer pressure, strength vs BTC, sentiment, order book
+    s50 = sma(c, 50)
+    s50_prev = mean(c[-55:-5]) if len(c) >= 55 else None
+    extra = [("MA", s50 is not None and c[-1] > s50 and (s50_prev is None or s50 >= s50_prev)),
+             ("Fib", fib_check(h, l, c, a)),
+             ("FVG", fvg_check(h, l, c, a))]
+    last3 = kl[-3:]
+    tb_sum, q_sum = sum(k.get("tb", 0.0) for k in last3), sum(k["qv"] for k in last3)
+    if q_sum > 0 and tb_sum > 0:
+        extra.append(("Buyers", tb_sum / q_sum >= 0.52))
+    brt = btc_tf_ret(tf, now)
+    if brt is not None and len(c) > 14:
+        extra.append(("vs BTC", (c[-1] / c[-13] - 1) > brt))
+    fng = fng_state(now)
+    if fng is not None:
+        extra.append(("Sentiment", 20 <= fng <= 88))
+    have = sum(1 for _, cond in extra if cond)
+    if core_ok and have >= MIN_CONF - 1:              # order book only for promising candidates
+        br = book_ratio(sym)
+        if br is not None:
+            extra.append(("Order book", br >= 0.8))
+    for name, cond in extra:
+        mark(name, cond)
+    total = sum(1 for _, cond in extra if cond)
+    return {"ok": core_ok and total >= MIN_CONF, "passed": passed, "failed": failed, "fng": fng}
+
+
+def conf_line(conf):
+    s = "\nChecks passed: " + ", ".join(conf["passed"])
+    if conf["failed"]:
+        s += "\nNot confirmed: " + ", ".join(conf["failed"])
+    extra = []
+    if conf.get("fng") is not None:
+        extra.append(f"Fear&Greed {conf['fng']}")
+    extra.append(f"BTC 1h {BTC['chg1h']:+.2f}%")
+    return s + "\n" + " | ".join(extra)
+
+
+def note_fail(mode, conf):
+    STATS[f"{mode}:rejected"] += 1
+    for name in conf["failed"]:
+        STATS[f"{mode}:no_{name}"] += 1
 
 
 # ----------------------------------------------------------------- SCALP
@@ -792,16 +1045,23 @@ def scalp_scan(state, tick, tf, now):
     for sym in top_by_ratio(tick, SCALP_TOP):
         if not cool_ok(state, f"scalp:{sym}", SCALP_CD, now):
             continue
-        sig = eval_scalp(fetch_tf(sym, tf))
+        kl = fetch_tf(sym, tf)
+        sig = eval_scalp(kl)
         time.sleep(0.1)
         if not sig:
             continue
+        STATS["scalp:setup"] += 1
         bk = bget("/api/v3/ticker/bookTicker", {"symbol": sym})
         try:
             spread = (float(bk["askPrice"]) / float(bk["bidPrice"]) - 1) * 100
         except Exception:
             continue
         if spread > MAX_SPREAD_PCT:
+            STATS["scalp:rejected (spread)"] += 1
+            continue
+        conf = confluence(kl, tf, "scalp", sym, now)
+        if not conf["ok"]:
+            note_fail("scalp", conf)
             continue
         t = tick[sym]
         e, a = t["price"], sig["atr"]
@@ -811,7 +1071,8 @@ def scalp_scan(state, tick, tf, now):
         cool_set(state, f"scalp:{sym}", now)
         why = "breakout above recent highs" if sig["brk"] else "strong volume candle"
         post = compose("scalp", t["base"], True,
-                       {"tf": tf, "why": why, "vm": sig["vm"], "ratio": t["ratio"]})
+                       {"tf": tf, "why": why, "vm": sig["vm"], "ratio": t["ratio"],
+                        "checks": conf["passed"]})
         msg = (f"SCALP {tf} {t['base']}/USDT\n"
                f"Entry: {fmt(e)}\n"
                f"SL: {fmt(sl)} ({(sl/e-1)*100:.2f}%)\n"
@@ -819,6 +1080,7 @@ def scalp_scan(state, tick, tf, now):
                f"TP2: {fmt(tp2)} (+{(tp2/e-1)*100:.2f}%)\n"
                f"Risk: {risk_pct:.2f}% | RR (TP1): 1:{rr1:.1f}\n"
                f"Spread: {spread:.3f}% | Vol: {sig['vm']:.1f}x | RSI: {sig['rsi']:.0f}")
+        msg += conf_line(conf)
         state["open"].append({"sym": sym, "base": t["base"], "mode": "scalp", "tf": tf, "ts": now,
                               "entry": e, "sl": sl, "tp1": tp1, "ttl": 6 * 3600})
         enqueue(1, 1200, t["base"], True, post, f"SCALP SIGNAL | {tf}",
@@ -899,9 +1161,15 @@ def swing_scan(state, tick, tf, now):
     for sym in top_by_ratio(tick, SWING_TOP):
         if not cool_ok(state, f"swing:{sym}", SWING_CD, now):
             continue
-        sig = eval_swing(fetch_tf(sym, tf), tf, btc_ret)
+        kl = fetch_tf(sym, tf)
+        sig = eval_swing(kl, tf, btc_ret)
         time.sleep(0.1)
         if not sig:
+            continue
+        STATS["swing:setup"] += 1
+        conf = confluence(kl, tf, "swing", sym, now)
+        if not conf["ok"]:
+            note_fail("swing", conf)
             continue
         t = tick[sym]
         e, a = t["price"], sig["atr"]
@@ -911,7 +1179,8 @@ def swing_scan(state, tick, tf, now):
         risk_pct = (e - sl) / e * 100
         rr1 = (tp1 - e) / (e - sl) if (e - sl) > 0 else 0
         cool_set(state, f"swing:{sym}", now)
-        post = compose("swing", t["base"], True, {"tf": tf, "vr": sig["vr"], "ratio": t["ratio"]})
+        post = compose("swing", t["base"], True, {"tf": tf, "vr": sig["vr"], "ratio": t["ratio"],
+                                                  "checks": conf["passed"]})
         msg = (f"SWING {tf} {t['base']}/USDT\n"
                f"Entry: {fmt(e)}\n"
                f"SL: {fmt(sl)} ({(sl/e-1)*100:.2f}%)\n"
@@ -920,6 +1189,7 @@ def swing_scan(state, tick, tf, now):
                f"Risk: {risk_pct:.2f}% | RR (TP1): 1:{rr1:.1f}\n"
                f"Vol build: {sig['vr']:.1f}x | RSI: {sig['rsi']:.0f}\n"
                f"Structure: Higher lows + EMA alignment")
+        msg += conf_line(conf)
         state["open"].append({"sym": sym, "base": t["base"], "mode": "swing", "tf": tf, "ts": now,
                               "entry": e, "sl": sl, "tp1": tp1, "ttl": 7 * 86400})
         enqueue(1, 3600, t["base"], True, post, f"SWING SIGNAL | {tf}",
@@ -971,6 +1241,21 @@ def main():
     log(f"start dry_run={DRY_RUN} poll={POLL_SEC}s runtime={MAX_RUNTIME_MIN}m "
         f"key={'yes' if square_key() else 'NO'} square_script={'yes' if find_square_script() else 'no (text-only posts)'}")
     tg(f"Coin bot started{' (dry run)' if DRY_RUN else ''}.")
+    chk = ["node=" + (shutil.which("node") or "MISSING")]
+    try:
+        import PIL
+        chk.append("Pillow=" + PIL.__version__)
+    except Exception as e:
+        chk.append(f"Pillow=MISSING({e})")
+    try:
+        make_card("TEST", True, "SELF CHECK", "image ok", os.path.join(CARD_DIR, "selfcheck.png"))
+        os.remove(os.path.join(CARD_DIR, "selfcheck.png"))
+        chk.append("card=ok")
+    except Exception as e:
+        chk.append(f"card=FAILED({e})")
+    log("image check:", ", ".join(chk))
+    if any(w in " ".join(chk) for w in ("MISSING", "FAILED")) or not find_square_script():
+        tg("Image check problem: " + ", ".join(chk) + (" | post-image.mjs not found" if not find_square_script() else ""))
     end = time.time() + MAX_RUNTIME_MIN * 60
     allowed, allowed_ts = None, 0
     last_scalp_min = last_swing_min = last_save = last_prune = 0
@@ -1020,6 +1305,9 @@ def main():
             if now - last_prune > 3600:
                 last_prune = now
                 state["cool"] = {k: v for k, v in state["cool"].items() if now - v < 86400}
+                if STATS:
+                    log("filter stats (last hour):", dict(STATS))
+                    STATS.clear()
             if now - last_save > 60:
                 last_save = now
                 save_state(state)

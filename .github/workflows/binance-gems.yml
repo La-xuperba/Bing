@@ -1,0 +1,78 @@
+name: BINANCE GEMS Spot Scanner
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub Actions cron is UTC. Bangladesh time is UTC+6.
+    - cron: "0 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: binance-gems-spot-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Set up Node.js for Binance Square image posting
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Download official Binance Square Post Skill
+        run: |
+          rm -rf /tmp/binance-skills-hub square-skill
+          git clone --depth 1 https://github.com/binance/binance-skills-hub.git /tmp/binance-skills-hub
+          cp -R /tmp/binance-skills-hub/skills/binance/square-post square-skill
+          test -f square-skill/scripts/post-image.mjs
+          test -f square-skill/scripts/lib.mjs
+          echo "Official Binance Square image-post skill is ready."
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check bot syntax and offline tests
+        run: |
+          python -m py_compile bot.py
+          python bot.py --selftest
+
+      - name: Run BINANCE GEMS
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BINANCE_SQUARE_OPENAPI_KEY: ${{ secrets.BINANCE_SQUARE_OPENAPI_KEY }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          MAX_RUNTIME_MIN: "345"
+          POLL_SEC: "30"
+          STATE_FILE: "state.json"
+          CARD_DIR: "cards"
+          SQUARE_SKILL_DIR: "square-skill"
+          DRY_RUN: "false"
+          PYTHONUNBUFFERED: "1"
+        run: python bot.py
+
+      - name: Save scanner state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update BINANCE GEMS scanner state [skip ci]"
+            git push
+          fi

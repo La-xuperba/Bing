@@ -3,7 +3,7 @@ name: BINANCE GEMS Spot Scanner
 on:
   workflow_dispatch:
   schedule:
-    # GitHub Actions cron is UTC. Bangladesh time is UTC+6.
+    # Every 6 hours (UTC)
     - cron: "0 */6 * * *"
 
 permissions:
@@ -17,9 +17,12 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -27,7 +30,7 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Set up Node.js for Binance Square image posting
+      - name: Set up Node.js for Binance Square
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -39,12 +42,21 @@ jobs:
           cp -R /tmp/binance-skills-hub/skills/binance/square-post square-skill
           test -f square-skill/scripts/post-image.mjs
           test -f square-skill/scripts/lib.mjs
-          echo "Official Binance Square image-post skill is ready."
+          echo "Official Square image-post skill ready."
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Restore scanner state
+        run: |
+          if [ -f state.json ]; then
+            echo "Existing scanner state found."
+          else
+            echo "No previous state file found. Starting fresh."
+            echo '{}' > state.json
+          fi
 
       - name: Check bot syntax and offline tests
         run: |
@@ -57,13 +69,21 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           BINANCE_SQUARE_OPENAPI_KEY: ${{ secrets.BINANCE_SQUARE_OPENAPI_KEY }}
           COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
-          MAX_RUNTIME_MIN: "345"
+
+          MAX_RUNTIME_MIN: "330"
           POLL_SEC: "30"
+
           STATE_FILE: "state.json"
+          COIN_COOLDOWN_MIN: "720"
+          SCALP_COOLDOWN_MIN: "720"
+          SWING_COOLDOWN_MIN: "720"
+
           CARD_DIR: "cards"
           SQUARE_SKILL_DIR: "square-skill"
+
           DRY_RUN: "false"
           PYTHONUNBUFFERED: "1"
+
         run: python bot.py
 
       - name: Save scanner state
@@ -71,8 +91,17 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state.json
-          if ! git diff --cached --quiet; then
-            git commit -m "Update BINANCE GEMS scanner state [skip ci]"
-            git push
+
+          if [ -f state.json ]; then
+            git add -f state.json
+
+            if ! git diff --cached --quiet; then
+              git commit -m "Update BINANCE GEMS scanner state [skip ci]"
+              git push origin "HEAD:${GITHUB_REF_NAME}"
+              echo "Scanner state successfully saved."
+            else
+              echo "No scanner state changes."
+            fi
+          else
+            echo "WARNING: state.json not found."
           fi
